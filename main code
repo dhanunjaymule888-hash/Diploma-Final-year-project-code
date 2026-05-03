@@ -1,0 +1,135 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include "ThingSpeak.h"
+#include <Servo.h>
+
+// WiFi settings
+const char* ssid = "YourWiFiSSID";
+const char* password = "YourWiFiPassword";
+
+// ThingSpeak settings
+unsigned long myChannelNumber = YOUR_CHANNEL_NUMBER;   // Replace with your channel ID
+const char * myWriteAPIKey = "YOUR_WRITE_API_KEY";     // Replace with your Write API Key
+
+WiFiClient client;
+
+// Ultrasonic Sensor U1 (Person detection)
+#define TRIG1 D5
+#define ECHO1 D6
+
+// Ultrasonic Sensor U2 (Fill level detection)
+#define TRIG2 D7
+#define ECHO2 D8
+
+// LEDs
+#define GREEN_LED D1
+#define RED_LED   D2
+
+// Servo motor
+Servo lidServo;
+#define SERVO_PIN D3
+
+long duration1, duration2;
+int distance1, distance2;
+int fillPercent;
+
+// Timer for fill-level check (30 min = 1,800,000 ms)
+unsigned long lastCheck = 0;
+const unsigned long checkInterval = 1800000; // 30 minutes in ms
+
+void setup() {
+  Serial.begin(115200);
+
+  // Pin setup
+  pinMode(TRIG1, OUTPUT);
+  pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT);
+  pinMode(ECHO2, INPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  lidServo.attach(SERVO_PIN);
+  lidServo.write(0); // Start with lid closed
+
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+  ThingSpeak.begin(client);
+}
+
+void loop() {
+  detectPerson();
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastCheck >= checkInterval || lastCheck == 0) {
+    lastCheck = currentMillis;
+    checkFillLevel();
+    sendToThingSpeak();
+  }
+}
+
+// Function: Detect person using U1
+void detectPerson() {
+  digitalWrite(TRIG1, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG1, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG1, LOW);
+
+  duration1 = pulseIn(ECHO1, HIGH, 30000); // timeout 30ms
+  distance1 = duration1 * 0.034 / 2;
+
+  if (distance1 > 0 && distance1 < 20) {
+    Serial.println("Person detected -> Opening lid");
+    lidServo.write(90); // Open lid
+    delay(3000);        // Keep open for 3 seconds
+    lidServo.write(0);  // Close lid
+    delay(500);
+  }
+}
+
+// Function: Measure fill level using U2
+void checkFillLevel() {
+  digitalWrite(TRIG2, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG2, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG2, LOW);
+
+  duration2 = pulseIn(ECHO2, HIGH, 30000); // timeout 30ms
+  distance2 = duration2 * 0.034 / 2;
+
+  int binHeight = 30; // Set to your dustbin height in cm
+  fillPercent = map(distance2, binHeight, 0, 0, 100);
+
+  if (fillPercent < 0) fillPercent = 0;
+  if (fillPercent > 100) fillPercent = 100;
+
+  Serial.print("Dustbin Fill Level: ");
+  Serial.print(fillPercent);
+  Serial.println("%");
+
+  // LED indication
+  if (fillPercent < 80) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+  } else {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
+  }
+}
+
+// Function: Upload data to ThingSpeak
+void sendToThingSpeak() {
+  int x = ThingSpeak.writeField(myChannelNumber, 1, fillPercent, myWriteAPIKey); 
+  if (x == 200) {
+    Serial.println("Data sent to ThingSpeak successfully");
+  } else {
+    Serial.println("Error sending data: " + String(x));
+  }
+}
