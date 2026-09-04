@@ -1,4 +1,4 @@
-# Smart Dustbin v2 – Human Detection + Fill Level Monitoring
+# Smart Dustbin – Human Detection + Fill Level Monitoring
 
 This project implements an automated dustbin that opens its lid when a person approaches and monitors the fill level using two ultrasonic sensors. Data is published to **Adafruit IO** for remote monitoring and visualization. The system is built for the **ESP32** and can be simulated in **Wokwi** or deployed on real hardware.
 
