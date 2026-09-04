@@ -1,135 +1,177 @@
-#include <ESP8266WiFi.h>
-#include <WiFiClient.h>
-#include "ThingSpeak.h"
-#include <Servo.h>
+/*
+  Smart Dustbin v2 (Corrected) - Human Detection + Fill Level Monitoring
+  ESP32 + Wokwi + Adafruit IO Dashboard
 
-// WiFi settings
-const char* ssid = "YourWiFiSSID";
-const char* password = "YourWiFiPassword";
+  Components:
+    - Ultrasonic 1 (Human detection): TRIG=5, ECHO=18
+    - Ultrasonic 2 (Bin fill level) : TRIG=19, ECHO=21
+    - Servo (bin lid)                : GPIO 13
+    - Green LED                      : GPIO 25
+    - Red LED                        : GPIO 26
 
-// ThingSpeak settings
-unsigned long myChannelNumber = YOUR_CHANNEL_NUMBER;   // Replace with your channel ID
-const char * myWriteAPIKey = "YOUR_WRITE_API_KEY";     // Replace with your Write API Key
+  Behavior:
+    1. Human detected within HUMAN_DETECT_CM -> servo opens to 90°,
+       auto‑closes back to 0° after 5 seconds.
+    2. Bin fill % calculated from ultrasonic 2 distance vs BIN_HEIGHT_CM.
+       Fill > 70% -> Red LED ON, Green OFF.
+       Fill <= 70% -> Green LED ON, Red OFF.
+    3. Publishes human presence, fill %, and LED state to Adafruit IO.
+*/
 
-WiFiClient client;
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include "AdafruitIO_WiFi.h"
 
-// Ultrasonic Sensor U1 (Person detection)
-#define TRIG1 D5
-#define ECHO1 D6
+// ---------------- WiFi & Adafruit IO Credentials ----------------
+#define WIFI_SSID   "Wokwi-GUEST"
+#define WIFI_PASS   ""
+#define IO_USERNAME "Flash9618"
+#define IO_KEY      "aio_iUjw47YeLeTOES28qTo8CnFDVYB7"
 
-// Ultrasonic Sensor U2 (Fill level detection)
-#define TRIG2 D7
-#define ECHO2 D8
+AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
+AdafruitIO_Feed *humanFeed = io.feed("human-detected");
+AdafruitIO_Feed *binFeed   = io.feed("dustbin-level");
+AdafruitIO_Feed *lidFeed   = io.feed("lid-status");
 
-// LEDs
-#define GREEN_LED D1
-#define RED_LED   D2
+// ---------------- Pins ----------------
+const int TRIG_HUMAN = 5;
+const int ECHO_HUMAN = 18;
+const int TRIG_BIN   = 19;
+const int ECHO_BIN   = 21;
+const int SERVO_PIN  = 13;
+const int GREEN_LED  = 25;
+const int RED_LED    = 26;
 
-// Servo motor
+// ---------------- Settings ----------------
+const float HUMAN_DETECT_CM = 30.0;      // how close counts as "person detected"
+const float BIN_HEIGHT_CM   = 30.0;      // sensor‑to‑bottom distance when bin is empty
+const float FILL_THRESHOLD  = 70.0;      // percent, switches LED color
+const unsigned long SERVO_OPEN_TIME = 5000;  // servo stays open 5 sec
+const unsigned long PUBLISH_INTERVAL = 10000; // send to Adafruit IO every 10 sec
+
+// ---------------- LED Polarity ----------------
+// If your LEDs are wired with anode to GPIO (active‑high), set this to 1.
+// If wired with cathode to GPIO (active‑low, common‑anode), set to 0.
+#define LED_ACTIVE_HIGH 0   // <-- change this to 1 if you use active‑high wiring
+
+// Helper macros to turn LEDs ON/OFF regardless of wiring
+#if LED_ACTIVE_HIGH
+  #define LED_ON  HIGH
+  #define LED_OFF LOW
+#else
+  #define LED_ON  LOW
+  #define LED_OFF HIGH
+#endif
+
 Servo lidServo;
-#define SERVO_PIN D3
+bool servoIsOpen = false;
+unsigned long servoOpenedAt = 0;
+unsigned long lastPublish = 0;
 
-long duration1, duration2;
-int distance1, distance2;
-int fillPercent;
+// ---------- Function to get averaged distance ----------
+float getDistance(int trigPin, int echoPin, int samples = 5) {
+  float sum = 0;
+  int valid = 0;
+  for (int i = 0; i < samples; i++) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
 
-// Timer for fill-level check (30 min = 1,800,000 ms)
-unsigned long lastCheck = 0;
-const unsigned long checkInterval = 1800000; // 30 minutes in ms
+    long duration = pulseIn(echoPin, HIGH, 50000); // timeout 50 ms
+    if (duration == 0) continue; // ignore timeouts
+    float dist = duration * 0.0343 / 2.0;
+    if (dist > 0 && dist < 400) { // sensible range
+      sum += dist;
+      valid++;
+    }
+    delay(20); // short gap between samples
+  }
+  if (valid == 0) return -1; // no valid reading
+  return sum / valid;
+}
 
 void setup() {
   Serial.begin(115200);
 
-  // Pin setup
-  pinMode(TRIG1, OUTPUT);
-  pinMode(ECHO1, INPUT);
-  pinMode(TRIG2, OUTPUT);
-  pinMode(ECHO2, INPUT);
+  pinMode(TRIG_HUMAN, OUTPUT);
+  pinMode(ECHO_HUMAN, INPUT);
+  pinMode(TRIG_BIN, OUTPUT);
+  pinMode(ECHO_BIN, INPUT);
   pinMode(GREEN_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
 
-  lidServo.attach(SERVO_PIN);
-  lidServo.write(0); // Start with lid closed
+  // Start with both LEDs off (using the defined OFF level)
+  digitalWrite(RED_LED, LED_OFF);
+  digitalWrite(GREEN_LED, LED_OFF);
 
-  // Connect WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  lidServo.attach(SERVO_PIN);
+  lidServo.write(0); // start closed
+
+  io.connect();
+  while (io.status() < AIO_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    Serial.println("Connecting to Adafruit IO...");
   }
-  Serial.println("\nWiFi Connected!");
-  ThingSpeak.begin(client);
+  Serial.println("Connected to Adafruit IO!");
 }
 
 void loop() {
-  detectPerson();
+  io.run(); // keeps Adafruit IO connected
 
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastCheck >= checkInterval || lastCheck == 0) {
-    lastCheck = currentMillis;
-    checkFillLevel();
-    sendToThingSpeak();
+  // ---------- 1. Human Detection + Servo ----------
+  float humanDistance = getDistance(TRIG_HUMAN, ECHO_HUMAN, 3);
+
+  if (humanDistance > 0 && humanDistance < HUMAN_DETECT_CM && !servoIsOpen) {
+    lidServo.write(90);
+    servoIsOpen = true;
+    servoOpenedAt = millis();
+    Serial.println("Human detected -> Servo open");
   }
-}
 
-// Function: Detect person using U1
-void detectPerson() {
-  digitalWrite(TRIG1, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG1, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG1, LOW);
-
-  duration1 = pulseIn(ECHO1, HIGH, 30000); // timeout 30ms
-  distance1 = duration1 * 0.034 / 2;
-
-  if (distance1 > 0 && distance1 < 20) {
-    Serial.println("Person detected -> Opening lid");
-    lidServo.write(90); // Open lid
-    delay(3000);        // Keep open for 3 seconds
-    lidServo.write(0);  // Close lid
-    delay(500);
+  if (servoIsOpen && millis() - servoOpenedAt >= SERVO_OPEN_TIME) {
+    lidServo.write(0);
+    servoIsOpen = false;
+    Serial.println("Servo closed");
   }
-}
 
-// Function: Measure fill level using U2
-void checkFillLevel() {
-  digitalWrite(TRIG2, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG2, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG2, LOW);
-
-  duration2 = pulseIn(ECHO2, HIGH, 30000); // timeout 30ms
-  distance2 = duration2 * 0.034 / 2;
-
-  int binHeight = 30; // Set to your dustbin height in cm
-  fillPercent = map(distance2, binHeight, 0, 0, 100);
-
-  if (fillPercent < 0) fillPercent = 0;
-  if (fillPercent > 100) fillPercent = 100;
-
-  Serial.print("Dustbin Fill Level: ");
-  Serial.print(fillPercent);
-  Serial.println("%");
-
-  // LED indication
-  if (fillPercent < 80) {
-    digitalWrite(GREEN_LED, HIGH);
-    digitalWrite(RED_LED, LOW);
+  // ---------- 2. Bin Fill Level + LEDs ----------
+  float binDistance = getDistance(TRIG_BIN, ECHO_BIN, 5);
+  float fillPercent = 0;
+  if (binDistance > 0 && binDistance < BIN_HEIGHT_CM) {
+    fillPercent = ((BIN_HEIGHT_CM - binDistance) / BIN_HEIGHT_CM) * 100.0;
   } else {
-    digitalWrite(GREEN_LED, LOW);
-    digitalWrite(RED_LED, HIGH);
+    // If reading is invalid, assume empty (0%) or keep previous? We'll keep 0.
+    fillPercent = 0;
   }
-}
+  fillPercent = constrain(fillPercent, 0, 100);
 
-// Function: Upload data to ThingSpeak
-void sendToThingSpeak() {
-  int x = ThingSpeak.writeField(myChannelNumber, 1, fillPercent, myWriteAPIKey); 
-  if (x == 200) {
-    Serial.println("Data sent to ThingSpeak successfully");
+  // Set LEDs according to fill level (using the defined ON/OFF levels)
+  if (fillPercent < FILL_THRESHOLD) {
+    digitalWrite(RED_LED, LED_ON);
+    digitalWrite(GREEN_LED, LED_OFF);
   } else {
-    Serial.println("Error sending data: " + String(x));
+    digitalWrite(RED_LED, LED_OFF);
+    digitalWrite(GREEN_LED, LED_ON);
   }
+
+  // ---------- 3. Send Data to Adafruit IO (throttled) ----------
+  if (millis() - lastPublish >= PUBLISH_INTERVAL) {
+    lastPublish = millis();
+
+    humanFeed->save(servoIsOpen ? 1 : 0);
+    binFeed->save(fillPercent);
+    lidFeed->save(servoIsOpen ? "OPEN" : "CLOSED");
+
+    Serial.print("Bin Fill: ");
+    Serial.print(fillPercent);
+    Serial.println("%");
+    Serial.print("Red LED: ");
+    Serial.println(digitalRead(RED_LED) ? "ON" : "OFF");
+    Serial.print("Green LED: ");
+    Serial.println(digitalRead(GREEN_LED) ? "ON" : "OFF");
+  }
+
+  delay(200); // small pause before next sensor reading
 }
